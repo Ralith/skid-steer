@@ -1,9 +1,12 @@
 use std::{
     any::Any,
-    fmt, mem,
+    fmt, future, mem,
     pin::Pin,
     sync::{Arc, OnceLock},
+    task::Poll,
 };
+
+use atomic_waker::AtomicWaker;
 
 pub struct Loader<C = ()>(Arc<LoaderShared<C>>);
 
@@ -13,10 +16,10 @@ impl<C: Sync + 'static> Loader<C> {
     }
 
     /// Begin loading `source`, immediately returning the [Asset] that will contain it
-    pub fn spawn_load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
+    pub fn load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
         let asset = self.0.create_asset::<S>();
         {
-            let asset = asset.clone();
+            let asset = asset.0.as_ref().unwrap().clone();
             self.0
                 .work_send
                 .try_send(Box::new(move |loader, context| {
@@ -24,18 +27,12 @@ impl<C: Sync + 'static> Loader<C> {
                         let Some(data) = source.load(&loader, context).await else {
                             return;
                         };
-                        _ = asset.0.as_ref().unwrap().data.set(data);
+                        _ = asset.data.set(data);
+                        asset.waker.wake();
                     })
                 }))
                 .unwrap();
         }
-        asset
-    }
-
-    /// Load `source`, waiting until it's loaded before yielding the [Asset] that contains it
-    pub async fn load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
-        let asset = self.0.create_asset::<S>();
-        // TODO
         asset
     }
 
@@ -92,6 +89,7 @@ impl<C: 'static> LoaderShared<C> {
                 S::free(data, ctx.downcast_ref::<C>().unwrap())
             },
             free_send: Some(self.free_send.clone()),
+            waker: AtomicWaker::new(),
         })))
     }
 
@@ -178,8 +176,25 @@ pub struct Asset<T: 'static + Send + Sync>(Option<Arc<AssetShared<T>>>);
 
 impl<T: 'static + Send + Sync> Asset<T> {
     /// Get the current value, if it's loaded
-    pub fn get(&self) -> Option<&T> {
+    pub fn try_get(&self) -> Option<&T> {
         self.0.as_ref().unwrap().data.get()
+    }
+
+    /// Get the current value once it's loaded
+    pub async fn get(&self) -> &T {
+        let this = self.0.as_ref().unwrap();
+        // Fast path
+        if let Some(x) = this.data.get() {
+            return x;
+        }
+        future::poll_fn(|cx| {
+            this.waker.register(cx.waker());
+            match this.data.get() {
+                None => return Poll::Pending,
+                Some(x) => return Poll::Ready(x),
+            }
+        })
+        .await
     }
 }
 
@@ -210,6 +225,7 @@ struct AssetShared<T: 'static> {
     data: OnceLock<T>,
     free_fn: FreeFn,
     free_send: Option<async_channel::Sender<FreeMsg>>,
+    waker: AtomicWaker,
 }
 
 impl<T: fmt::Debug + 'static> fmt::Debug for AssetShared<T> {
