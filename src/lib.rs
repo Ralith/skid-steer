@@ -49,18 +49,28 @@ struct LoaderShared {
 
 impl LoaderShared {
     fn create_asset<C: 'static, S: Source<C>>(&self) -> Asset<S::Output> {
-        Asset(Arc::new(AssetShared {
+        Asset(Some(Arc::new(AssetShared {
             data: OnceLock::default(),
-            free_fn: |x| -> FreeMsg {
-                Box::new(|ctx: &dyn Any| S::free(x, ctx.downcast_ref::<C>().unwrap()))
+            free_fn: |x, ctx| {
+                let Ok(x) = Arc::downcast::<AssetShared<S::Output>>(x) else {
+                    unreachable!()
+                };
+                // Unwrap guaranteed to succeed here because `Asset::drop` checks for successful
+                // `Arc::get_mut` before dispatching a free message
+                let x = Arc::into_inner(x).unwrap().data;
+                let Some(data) = x.into_inner() else {
+                    // Asset was never loaded
+                    return;
+                };
+                S::free(data, ctx.downcast_ref::<C>().unwrap())
             },
-            free_send: self.free_send.clone(),
-        }))
+            free_send: Some(self.free_send.clone()),
+        })))
     }
 
     fn free<C: 'static>(&self, context: &C) {
         for msg in self.free_recv.try_iter() {
-            msg(context);
+            (msg.f)(msg.asset, context);
         }
     }
 }
@@ -75,8 +85,12 @@ impl Default for LoaderShared {
     }
 }
 
-type FreeMsg = Box<dyn FnOnce(&dyn Any)>;
-type FreeFn<T> = fn(T) -> FreeMsg;
+struct FreeMsg {
+    asset: Arc<dyn Any + Send + Sync>,
+    f: FreeFn,
+}
+/// A type-erased [Source::free] implementation
+type FreeFn = fn(Arc<dyn Any + Send + Sync>, &dyn Any);
 
 /// Description of an asset from which it can be loaded
 ///
@@ -115,39 +129,42 @@ pub trait Source<C>: Send + 'static {
 }
 
 #[derive(Debug)]
-pub struct Asset<T: 'static>(Arc<AssetShared<T>>);
+pub struct Asset<T: 'static + Send + Sync>(Option<Arc<AssetShared<T>>>);
 
-impl<T: 'static> Asset<T> {
+impl<T: 'static + Send + Sync> Asset<T> {
     /// Get the current value, if it's loaded
     pub fn get(&self) -> Option<&T> {
-        self.0.data.get()
+        self.0.as_ref().unwrap().data.get()
     }
 }
 
-impl<T: 'static> Clone for Asset<T> {
+impl<T: 'static + Send + Sync> Clone for Asset<T> {
     fn clone(&self) -> Self {
         Asset(self.0.clone())
     }
 }
 
-impl<T: 'static> Drop for Asset<T> {
+impl<T: 'static + Send + Sync> Drop for Asset<T> {
     fn drop(&mut self) {
-        let Some(shared) = Arc::get_mut(&mut self.0) else {
-            // Other references remain
+        // If this is the last reference to the asset, send the underlying `Arc` back to the loader
+        // to be freed w/ the proper context.
+        let mut this = self.0.take().unwrap();
+        let Some(this_mut) = Arc::get_mut(&mut this) else {
+            // This isn't the last reference
             return;
         };
-        let Some(data) = mem::take(&mut shared.data).into_inner() else {
-            // Asset was never loaded
-            return;
-        };
-        _ = shared.free_send.send((shared.free_fn)(data));
+        let sender = mem::take(&mut this_mut.free_send).unwrap();
+        _ = sender.send(FreeMsg {
+            f: this.free_fn,
+            asset: this,
+        });
     }
 }
 
 struct AssetShared<T: 'static> {
     data: OnceLock<T>,
-    free_fn: FreeFn<T>,
-    free_send: mpsc::Sender<FreeMsg>,
+    free_fn: FreeFn,
+    free_send: Option<mpsc::Sender<FreeMsg>>,
 }
 
 impl<T: fmt::Debug + 'static> fmt::Debug for AssetShared<T> {
