@@ -36,26 +36,27 @@ impl<C: Sync + 'static> Loader<C> {
         let asset = self.0.create_asset::<S>();
         {
             let asset = asset.clone();
-            self.0
-                .work_send
-                .try_send(Box::new(move |loader, context| {
-                    Box::pin(async move {
-                        let Some(data) = source.load(&loader, context).await else {
-                            return;
-                        };
-                        _ = asset.0.data.set(data);
-                        asset.0.waker.wake();
-                    })
-                }))
-                .unwrap();
+            // The channel is unbounded, so it can never become full. If the channel is closed, we
+            // silently drop the task.
+            _ = self.0.work_send.try_send(Box::new(move |loader, context| {
+                Box::pin(async move {
+                    let Some(data) = source.load(&loader, context).await else {
+                        return;
+                    };
+                    // Guaranteed to succeed because there are no other callers of `set`
+                    asset.0.data.set(data).unwrap_or_else(|_| unreachable!());
+                    asset.0.waker.wake();
+                })
+            }));
         }
         asset
     }
 
     /// Yields a work item that should be ran on a background thread pool to make progress
     ///
-    /// This future is cancel-safe, but see also [Task::run].
-    pub async fn next_task<'a>(&self) -> Option<Task<C>> {
+    /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
+    /// has been called.
+    pub async fn next_task(&self) -> Option<Task<C>> {
         let work = self.0.work_recv.recv().await.ok()?;
         let loader = self.clone();
         Some(Task { loader, work })
@@ -67,6 +68,17 @@ impl<C: Sync + 'static> Loader<C> {
         let work = self.0.work_recv.try_recv().ok()?;
         let loader = self.clone();
         Some(Task { loader, work })
+    }
+
+    /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
+    /// down
+    pub fn close(&self) {
+        self.0.work_send.close();
+    }
+
+    /// Whether [close](Self::close) has been called
+    pub fn is_closed(&self) -> bool {
+        self.0.work_recv.is_closed()
     }
 }
 
