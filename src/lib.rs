@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     fmt, future, mem,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -19,7 +18,7 @@ impl<C: Sync + 'static> Loader<C> {
     pub fn load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
         let asset = self.0.create_asset::<S>();
         {
-            let asset = asset.0.as_ref().unwrap().clone();
+            let asset = asset.clone();
             self.0
                 .work_send
                 .try_send(Box::new(move |loader, context| {
@@ -27,8 +26,8 @@ impl<C: Sync + 'static> Loader<C> {
                         let Some(data) = source.load(&loader, context).await else {
                             return;
                         };
-                        _ = asset.data.set(data);
-                        asset.waker.wake();
+                        _ = asset.0.data.set(data);
+                        asset.0.waker.wake();
                     })
                 }))
                 .unwrap();
@@ -67,58 +66,33 @@ impl<C> Default for Loader<C> {
 struct LoaderShared<C> {
     work_send: async_channel::Sender<WorkMsg<C>>,
     work_recv: async_channel::Receiver<WorkMsg<C>>,
-    free_send: async_channel::Sender<FreeMsg>,
-    free_recv: async_channel::Receiver<FreeMsg>,
 }
 
 impl<C: 'static> LoaderShared<C> {
     fn create_asset<S: Source<C>>(&self) -> Asset<S::Output> {
-        Asset(Some(Arc::new(AssetShared {
+        let work_send = self.work_send.clone();
+        Asset(Arc::new(AssetShared {
             data: OnceLock::default(),
-            free_fn: |x, ctx| {
-                let Ok(x) = Arc::downcast::<AssetShared<S::Output>>(x) else {
-                    unreachable!()
-                };
-                // Unwrap guaranteed to succeed here because `Asset::drop` checks for successful
-                // `Arc::get_mut` before dispatching a free message
-                let x = Arc::into_inner(x).unwrap().data;
-                let Some(data) = x.into_inner() else {
-                    // Asset was never loaded
-                    return;
-                };
-                S::free(data, ctx.downcast_ref::<C>().unwrap())
-            },
-            free_send: Some(self.free_send.clone()),
+            free_send: Box::new(move |x| {
+                _ = work_send.try_send(Box::new(|_, ctx| {
+                    S::free(x, ctx);
+                    Box::pin(async {})
+                }));
+            }),
             waker: AtomicWaker::new(),
-        })))
-    }
-
-    fn free(&self, context: &C) {
-        while let Ok(msg) = self.free_recv.try_recv() {
-            (msg.f)(msg.asset, context);
-        }
+        }))
     }
 }
 
 impl<C> Default for LoaderShared<C> {
     fn default() -> Self {
-        let (free_send, free_recv) = async_channel::unbounded();
         let (work_send, work_recv) = async_channel::unbounded();
         Self {
             work_send,
             work_recv,
-            free_send,
-            free_recv,
         }
     }
 }
-
-struct FreeMsg {
-    asset: Arc<dyn Any + Send + Sync>,
-    f: FreeFn,
-}
-/// A type-erased [Source::free] implementation
-type FreeFn = fn(Arc<dyn Any + Send + Sync>, &dyn Any);
 
 type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type WorkMsg<C> = Box<dyn for<'a> FnOnce(&'a Loader<C>, &'a C) -> LoadFuture<'a> + Send + 'static>;
@@ -168,28 +142,27 @@ pub trait Source<C>: Send + 'static {
     /// Dispose of this asset's output when it's no longer needed
     ///
     /// Useful if [Self::Output] refers to resources stored elsewhere, e.g. in GPU memory
-    fn free(output: Self::Output, context: &C) {}
+    fn free(_output: Self::Output, _context: &C) {}
 }
 
 #[derive(Debug)]
-pub struct Asset<T: 'static + Send + Sync>(Option<Arc<AssetShared<T>>>);
+pub struct Asset<T: 'static>(Arc<AssetShared<T>>);
 
 impl<T: 'static + Send + Sync> Asset<T> {
     /// Get the current value, if it's loaded
     pub fn try_get(&self) -> Option<&T> {
-        self.0.as_ref().unwrap().data.get()
+        self.0.data.get()
     }
 
     /// Get the current value once it's loaded
     pub async fn get(&self) -> &T {
-        let this = self.0.as_ref().unwrap();
         // Fast path
-        if let Some(x) = this.data.get() {
+        if let Some(x) = self.0.data.get() {
             return x;
         }
         future::poll_fn(|cx| {
-            this.waker.register(cx.waker());
-            match this.data.get() {
+            self.0.waker.register(cx.waker());
+            match self.0.data.get() {
                 None => return Poll::Pending,
                 Some(x) => return Poll::Ready(x),
             }
@@ -198,33 +171,32 @@ impl<T: 'static + Send + Sync> Asset<T> {
     }
 }
 
-impl<T: 'static + Send + Sync> Clone for Asset<T> {
+impl<T: 'static> Clone for Asset<T> {
     fn clone(&self) -> Self {
         Asset(self.0.clone())
     }
 }
 
-impl<T: 'static + Send + Sync> Drop for Asset<T> {
+impl<T: 'static> Drop for Asset<T> {
     fn drop(&mut self) {
         // If this is the last reference to the asset, send the underlying `Arc` back to the loader
         // to be freed w/ the proper context.
-        let mut this = self.0.take().unwrap();
-        let Some(this_mut) = Arc::get_mut(&mut this) else {
+        let Some(shared) = Arc::get_mut(&mut self.0) else {
             // This isn't the last reference
             return;
         };
-        let sender = mem::take(&mut this_mut.free_send).unwrap();
-        _ = sender.try_send(FreeMsg {
-            f: this.free_fn,
-            asset: this,
-        });
+        let Some(data) = mem::take(&mut shared.data).into_inner() else {
+            // This asset was never loaded
+            return;
+        };
+        let send = mem::replace(&mut shared.free_send, Box::new(|_| {}));
+        send(data);
     }
 }
 
 struct AssetShared<T: 'static> {
     data: OnceLock<T>,
-    free_fn: FreeFn,
-    free_send: Option<async_channel::Sender<FreeMsg>>,
+    free_send: Box<dyn FnOnce(T) + Send + Sync>,
     waker: AtomicWaker,
 }
 
