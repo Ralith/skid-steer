@@ -7,6 +7,23 @@ use std::{
 
 use atomic_waker::AtomicWaker;
 
+/// Dispatches work to asynchronously populate [Asset] handles with data
+///
+/// A [Loader] constructs handles that refer to data while it's [load](Self::load) in the
+/// background. For any work to happen, [next_task] must be polled regularly on a clone of the
+/// [Loader], and the [Task]s it yields must be [ran](Task::run). For best performance, call
+/// [next_task] in a loop, spawning off the [Task]s into a multithreaded executor without waiting
+/// for their completion.
+///
+/// While a [Source] is [load](Source::load)ing, it may access the [Loader] and a user-controlled
+/// context. The context is also available when an asset is [free](Source::free)d. This enables
+/// advanced use cases like:
+///
+/// - Reading assets directly into GPU memory
+/// - Loading other assets
+/// - Caching intermediate results
+///
+/// [next_task]: Self::next_task
 pub struct Loader<C = ()>(Arc<LoaderShared<C>>);
 
 impl<C: Sync + 'static> Loader<C> {
@@ -36,6 +53,8 @@ impl<C: Sync + 'static> Loader<C> {
     }
 
     /// Yields a work item that should be ran on a background thread pool to make progress
+    ///
+    /// This future is cancel-safe, but see also [Task::run].
     pub async fn next_task<'a>(&self) -> Option<Task<C>> {
         let work = self.0.work_recv.recv().await.ok()?;
         let loader = self.clone();
@@ -97,6 +116,7 @@ impl<C> Default for LoaderShared<C> {
 type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type WorkMsg<C> = Box<dyn for<'a> FnOnce(&'a Loader<C>, &'a C) -> LoadFuture<'a> + Send + 'static>;
 
+/// A work item from [Loader::next_task]
 pub struct Task<C> {
     loader: Loader<C>,
     work: WorkMsg<C>,
@@ -104,6 +124,9 @@ pub struct Task<C> {
 
 impl<C> Task<C> {
     /// Execute the work item
+    ///
+    /// This future is cancel-safe if and only if every [Source::load] future used with the
+    /// associated [Loader] is cancel-safe.
     pub async fn run(self, context: &C) {
         (self.work)(&self.loader, context).await;
     }
@@ -115,36 +138,43 @@ impl<C> Task<C> {
 /// ```
 /// # use std::{fs, path::PathBuf};
 /// # use skid_steer::*;
-/// # fn decode_png(x: Vec<u8>) -> Option<Vec<u8>> { None }
+/// # struct Image;
+/// # fn decode_png(x: Vec<u8>) -> Option<Image> { None }
 /// struct Sprite(PathBuf);
-/// impl<C> Source<C> for Sprite {
-///     type Output = Vec<u8>;
-///     fn load<'a>(self, loader: &'a Loader<C>, _: &'a C) -> impl Future<Output = Option<Self::Output>> + Send + 'a {
-///         async move {
-///             let data = fs::read(&self.0).ok()?;
-///             Some(decode_png(data)?)
-///         }
+/// impl<C: Sync> Source<C> for Sprite {
+///     type Output = Image;
+///     async fn load<'a>(self, _: &'a Loader<C>, _: &'a C) -> Option<Image> {
+///         let data = fs::read(&self.0).ok()?;
+///         Some(decode_png(data)?)
 ///     }
 /// }
-///
 /// ```
 pub trait Source<C>: Send + 'static {
     /// Type of data available after the asset has been loaded
     type Output: Send + Sync + 'static;
 
     /// Load the asset described by `self`, returning [None] on failure
+    ///
+    /// Reasonable implementations might:
+    /// - Read data from disk
+    /// - Fetch data from a remote server
+    /// - Decode or transform data for more efficient access
+    /// - Procedurally generate data
+    /// - Upload data to a GPU
     fn load<'a>(
         self,
         loader: &'a Loader<C>,
         context: &'a C,
     ) -> impl Future<Output = Option<Self::Output>> + Send + 'a;
 
-    /// Dispose of this asset's output when it's no longer needed
+    /// Dispose of the output after all [Asset] references have been dropped
     ///
-    /// Useful if [Self::Output] refers to resources stored elsewhere, e.g. in GPU memory
+    /// Most implementations won't need to implement this. Useful if [Self::Output] refers to
+    /// resources stored elsewhere without RAII, e.g. in unsafely managed GPU memory.
     fn free(_output: Self::Output, _context: &C) {}
 }
 
+/// Handle to data that might not be available yet
 #[derive(Debug)]
 pub struct Asset<T: 'static>(Arc<AssetShared<T>>);
 
