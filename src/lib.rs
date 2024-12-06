@@ -1,54 +1,81 @@
 use std::{
     any::Any,
-    fmt,
-    marker::PhantomData,
-    mem,
-    sync::{mpsc, Arc, OnceLock},
+    fmt, mem,
+    pin::Pin,
+    sync::{Arc, OnceLock},
 };
 
-#[derive(Clone)]
-pub struct Loader<C = ()>(Arc<LoaderShared>, PhantomData<fn(&C)>);
+pub struct Loader<C = ()>(Arc<LoaderShared<C>>);
 
-impl<C: 'static> Loader<C> {
+impl<C: Sync + 'static> Loader<C> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Begin loading `source`, immediately returning the [Asset] that will contain it
     pub fn spawn_load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
-        let asset = self.0.create_asset::<C, S>();
-        // TODO
+        let asset = self.0.create_asset::<S>();
+        {
+            let asset = asset.clone();
+            self.0
+                .work_send
+                .try_send(Box::new(move |loader, context| {
+                    Box::pin(async move {
+                        let Some(data) = source.load(&loader, context).await else {
+                            return;
+                        };
+                        _ = asset.0.as_ref().unwrap().data.set(data);
+                    })
+                }))
+                .unwrap();
+        }
         asset
     }
 
     /// Load `source`, waiting until it's loaded before yielding the [Asset] that contains it
     pub async fn load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
-        let asset = self.0.create_asset::<C, S>();
+        let asset = self.0.create_asset::<S>();
         // TODO
         asset
     }
 
-    /// Handle `load` operations called by other threads, until all other `Loader`s are dropped
-    ///
-    /// May be called from multiple threads to enable parallelism
-    pub async fn drive(self, context: &C) {
-        todo!()
+    /// Yields a work item that should be ran on a background thread pool to make progress
+    pub async fn next_task<'a>(&self) -> Option<Task<C>> {
+        let work = self.0.work_recv.recv().await.ok()?;
+        let loader = self.clone();
+        Some(Task { loader, work })
+    }
+
+    /// Like [next_task](Self::next_task), except returning `None` immediately if no tasks are
+    /// currently queued
+    pub fn try_next_task(&self) -> Option<Task<C>> {
+        let work = self.0.work_recv.try_recv().ok()?;
+        let loader = self.clone();
+        Some(Task { loader, work })
+    }
+}
+
+impl<C> Clone for Loader<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
 impl<C> Default for Loader<C> {
     fn default() -> Self {
-        Self(Default::default(), PhantomData)
+        Self(Default::default())
     }
 }
 
-struct LoaderShared {
-    free_send: mpsc::Sender<FreeMsg>,
-    free_recv: mpsc::Receiver<FreeMsg>,
+struct LoaderShared<C> {
+    work_send: async_channel::Sender<WorkMsg<C>>,
+    work_recv: async_channel::Receiver<WorkMsg<C>>,
+    free_send: async_channel::Sender<FreeMsg>,
+    free_recv: async_channel::Receiver<FreeMsg>,
 }
 
-impl LoaderShared {
-    fn create_asset<C: 'static, S: Source<C>>(&self) -> Asset<S::Output> {
+impl<C: 'static> LoaderShared<C> {
+    fn create_asset<S: Source<C>>(&self) -> Asset<S::Output> {
         Asset(Some(Arc::new(AssetShared {
             data: OnceLock::default(),
             free_fn: |x, ctx| {
@@ -68,17 +95,20 @@ impl LoaderShared {
         })))
     }
 
-    fn free<C: 'static>(&self, context: &C) {
-        for msg in self.free_recv.try_iter() {
+    fn free(&self, context: &C) {
+        while let Ok(msg) = self.free_recv.try_recv() {
             (msg.f)(msg.asset, context);
         }
     }
 }
 
-impl Default for LoaderShared {
+impl<C> Default for LoaderShared<C> {
     fn default() -> Self {
-        let (free_send, free_recv) = mpsc::channel();
+        let (free_send, free_recv) = async_channel::unbounded();
+        let (work_send, work_recv) = async_channel::unbounded();
         Self {
+            work_send,
+            work_recv,
             free_send,
             free_recv,
         }
@@ -91,6 +121,21 @@ struct FreeMsg {
 }
 /// A type-erased [Source::free] implementation
 type FreeFn = fn(Arc<dyn Any + Send + Sync>, &dyn Any);
+
+type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type WorkMsg<C> = Box<dyn for<'a> FnOnce(&'a Loader<C>, &'a C) -> LoadFuture<'a> + Send + 'static>;
+
+pub struct Task<C> {
+    loader: Loader<C>,
+    work: WorkMsg<C>,
+}
+
+impl<C> Task<C> {
+    /// Execute the work item
+    pub async fn run(self, context: &C) {
+        (self.work)(&self.loader, context).await;
+    }
+}
 
 /// Description of an asset from which it can be loaded
 ///
@@ -154,7 +199,7 @@ impl<T: 'static + Send + Sync> Drop for Asset<T> {
             return;
         };
         let sender = mem::take(&mut this_mut.free_send).unwrap();
-        _ = sender.send(FreeMsg {
+        _ = sender.try_send(FreeMsg {
             f: this.free_fn,
             asset: this,
         });
@@ -164,7 +209,7 @@ impl<T: 'static + Send + Sync> Drop for Asset<T> {
 struct AssetShared<T: 'static> {
     data: OnceLock<T>,
     free_fn: FreeFn,
-    free_send: Option<mpsc::Sender<FreeMsg>>,
+    free_send: Option<async_channel::Sender<FreeMsg>>,
 }
 
 impl<T: fmt::Debug + 'static> fmt::Debug for AssetShared<T> {
