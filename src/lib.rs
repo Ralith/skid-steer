@@ -212,7 +212,6 @@ pub trait Source<C>: Send + 'static {
 }
 
 /// Handle to data that might not be available yet
-#[derive(Debug)]
 pub struct Asset<T: 'static>(Arc<AssetShared<T>>);
 
 impl<T: 'static + Send + Sync> Asset<T> {
@@ -248,6 +247,12 @@ impl<T: 'static + Send + Sync> Asset<T> {
     }
 }
 
+impl<T: fmt::Debug + 'static> fmt::Debug for Asset<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.data.fmt(f)
+    }
+}
+
 impl<T: 'static> Clone for Asset<T> {
     fn clone(&self) -> Self {
         Asset(self.0.clone())
@@ -276,12 +281,6 @@ struct AssetShared<T: 'static> {
     free_send: Box<dyn FnOnce(T) + Send + Sync>,
     waker: AtomicWaker,
     abandoned: AtomicBool,
-}
-
-impl<T: fmt::Debug + 'static> fmt::Debug for AssetShared<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.data.fmt(f)
-    }
 }
 
 #[cfg(test)]
