@@ -247,3 +247,41 @@ impl<T: fmt::Debug + 'static> fmt::Debug for AssetShared<T> {
         self.data.fmt(f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pollster::block_on;
+
+    struct Trivial;
+
+    impl<C: Sync> Source<C> for Trivial {
+        type Output = ();
+
+        async fn load<'a>(self, _: &'a Loader<C>, _: &'a C) -> Option<()> {
+            Some(())
+        }
+    }
+
+    #[test]
+    fn smoke() {
+        let loader = Loader::<()>::new();
+        let asset = loader.load(Trivial);
+        assert!(asset.try_get().is_none());
+
+        let load_task = loader.try_next_task().unwrap();
+        assert!(loader.try_next_task().is_none());
+        block_on(load_task.run(&()));
+        assert!(asset.try_get().is_some());
+        block_on(asset.get());
+        drop(asset);
+
+        let free_task = loader.try_next_task().unwrap();
+        assert!(loader.try_next_task().is_none());
+        block_on(free_task.run(&()));
+
+        loader.close();
+        assert!(loader.is_closed());
+        assert!(block_on(loader.next_task()).is_none());
+    }
+}

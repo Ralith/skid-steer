@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 async-channel = "2.3.1"
 atomic-waker = "1.1.2"
+
+[dev-dependencies]
+pollster = "0.4.0"
