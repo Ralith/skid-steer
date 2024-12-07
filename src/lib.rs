@@ -1,7 +1,10 @@
 use std::{
     fmt, future, mem,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
     task::Poll,
 };
 
@@ -35,7 +38,7 @@ impl<C: Sync + 'static> Loader<C> {
     pub fn load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
         let asset = self.0.create_asset::<S>();
         {
-            let asset = asset.clone();
+            let mut asset = CancelGuard(Some(asset.clone()));
             // The channel is unbounded, so it can never become full. If the channel is closed, we
             // silently drop the task.
             _ = self.0.work_send.try_send(Box::new(move |loader, context| {
@@ -43,6 +46,7 @@ impl<C: Sync + 'static> Loader<C> {
                     let Some(data) = source.load(&loader, context).await else {
                         return;
                     };
+                    let asset = asset.0.take().unwrap();
                     // Guaranteed to succeed because there are no other callers of `set`
                     asset.0.data.set(data).unwrap_or_else(|_| unreachable!());
                     asset.0.waker.wake();
@@ -94,6 +98,18 @@ impl<C> Default for Loader<C> {
     }
 }
 
+struct CancelGuard<T: 'static>(Option<Asset<T>>);
+
+impl<T: 'static> Drop for CancelGuard<T> {
+    fn drop(&mut self) {
+        let Some(asset) = self.0.take() else {
+            return;
+        };
+        asset.0.abandoned.store(true, Ordering::Relaxed);
+        asset.0.waker.wake();
+    }
+}
+
 struct LoaderShared<C> {
     work_send: async_channel::Sender<WorkMsg<C>>,
     work_recv: async_channel::Receiver<WorkMsg<C>>,
@@ -111,6 +127,7 @@ impl<C: 'static> LoaderShared<C> {
                 }));
             }),
             waker: AtomicWaker::new(),
+            abandoned: AtomicBool::new(false),
         }))
     }
 }
@@ -122,6 +139,14 @@ impl<C> Default for LoaderShared<C> {
             work_send,
             work_recv,
         }
+    }
+}
+
+impl<C> Drop for LoaderShared<C> {
+    fn drop(&mut self) {
+        // Drain the channel so any in-flight Assets get gracefully abandoned
+        self.work_recv.close();
+        while let Ok(_) = self.work_recv.try_recv() {}
     }
 }
 
@@ -196,20 +221,30 @@ impl<T: 'static + Send + Sync> Asset<T> {
         self.0.data.get()
     }
 
-    /// Get the current value once it's loaded
-    pub async fn get(&self) -> &T {
+    /// Get the current value once it's loaded, or `None` if it's [abandoned](Self::is_abandoned)
+    pub async fn get(&self) -> Option<&T> {
         // Fast path
         if let Some(x) = self.0.data.get() {
-            return x;
+            return Some(x);
         }
         future::poll_fn(|cx| {
             self.0.waker.register(cx.waker());
             match self.0.data.get() {
+                Some(x) => return Poll::Ready(Some(x)),
+                None if self.is_abandoned() => return Poll::Ready(None),
                 None => return Poll::Pending,
-                Some(x) => return Poll::Ready(x),
             }
         })
         .await
+    }
+
+    /// Whether `try_get` is guaranteed to return `None` forever
+    ///
+    /// Indicates that either the [Source::load] operation returned [None], or the [Loader] was
+    /// dropped before the [Source::load] operation ran.
+    #[inline]
+    pub fn is_abandoned(&self) -> bool {
+        self.0.abandoned.load(Ordering::Relaxed)
     }
 }
 
@@ -240,6 +275,7 @@ struct AssetShared<T: 'static> {
     data: OnceLock<T>,
     free_send: Box<dyn FnOnce(T) + Send + Sync>,
     waker: AtomicWaker,
+    abandoned: AtomicBool,
 }
 
 impl<T: fmt::Debug + 'static> fmt::Debug for AssetShared<T> {
@@ -263,6 +299,16 @@ mod tests {
         }
     }
 
+    struct Failed;
+
+    impl<C: Sync> Source<C> for Failed {
+        type Output = ();
+
+        async fn load<'a>(self, _: &'a Loader<C>, _: &'a C) -> Option<()> {
+            None
+        }
+    }
+
     #[test]
     fn smoke() {
         let loader = Loader::<()>::new();
@@ -283,5 +329,24 @@ mod tests {
         loader.close();
         assert!(loader.is_closed());
         assert!(block_on(loader.next_task()).is_none());
+    }
+
+    #[test]
+    fn abandoned_by_dropped_loader() {
+        let loader = Loader::<()>::new();
+        let asset = loader.load(Trivial);
+        assert!(!asset.is_abandoned());
+        drop(loader);
+        assert!(asset.is_abandoned());
+    }
+
+    #[test]
+    fn abandoned_by_failed_load() {
+        let loader = Loader::<()>::new();
+        let asset = loader.load(Failed);
+        assert!(!asset.is_abandoned());
+        let load_task = loader.try_next_task().unwrap();
+        block_on(load_task.run(&()));
+        assert!(asset.is_abandoned());
     }
 }
