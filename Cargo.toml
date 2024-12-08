@@ -2,6 +2,12 @@
 name = "skid-steer"
 version = "0.1.0"
 edition = "2024"
+description = "Minimal framework for async game asset loading"
+authors = ["Benjamin Saunders <ben.e.saunders@gmail.com>"]
+license = "MIT OR Apache-2.0 OR Zlib"
+categories = ["asynchronous", "concurrency", "game-development"]
+repository = "https://github.com/Ralith/skid-steer"
+readme = "README.md"
 
 [dependencies]
 async-channel = "2.3.1"
