@@ -1,5 +1,7 @@
 use std::{
-    fmt, future, mem,
+    fmt, future,
+    future::Future,
+    mem,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
