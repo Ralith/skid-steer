@@ -43,17 +43,19 @@ impl<C: Sync + 'static> Loader<C> {
             let mut asset = CancelGuard(Some(asset.clone()));
             // The channel is unbounded, so it can never become full. If the channel is closed, we
             // silently drop the task.
-            _ = self.0.work_send.try_send(Box::new(move |context| {
-                Box::pin(async move {
-                    let Some(data) = source.load(context).await else {
-                        return;
-                    };
-                    let asset = asset.0.take().unwrap();
-                    // Guaranteed to succeed because there are no other callers of `set`
-                    asset.0.data.set(data).unwrap_or_else(|_| unreachable!());
-                    asset.0.waker.wake();
-                })
-            }));
+            _ = self.0.work_send.try_send(Task {
+                work: Box::new(move |context| {
+                    Box::pin(async move {
+                        let Some(data) = source.load(context).await else {
+                            return;
+                        };
+                        let asset = asset.0.take().unwrap();
+                        // Guaranteed to succeed because there are no other callers of `set`
+                        asset.0.data.set(data).unwrap_or_else(|_| unreachable!());
+                        asset.0.waker.wake();
+                    })
+                }),
+            });
         }
         asset
     }
@@ -63,15 +65,13 @@ impl<C: Sync + 'static> Loader<C> {
     /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
     /// has been called.
     pub async fn next_task(&self) -> Option<Task<C>> {
-        let work = self.0.work_recv.recv().await.ok()?;
-        Some(Task { work })
+        self.0.work_recv.recv().await.ok()
     }
 
     /// Like [next_task](Self::next_task), except returning `None` immediately if no tasks are
     /// currently queued
     pub fn try_next_task(&self) -> Option<Task<C>> {
-        let work = self.0.work_recv.try_recv().ok()?;
-        Some(Task { work })
+        self.0.work_recv.try_recv().ok()
     }
 
     /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
@@ -111,8 +111,8 @@ impl<T: 'static> Drop for CancelGuard<T> {
 }
 
 struct LoaderShared<C> {
-    work_send: async_channel::Sender<WorkMsg<C>>,
-    work_recv: async_channel::Receiver<WorkMsg<C>>,
+    work_send: async_channel::Sender<Task<C>>,
+    work_recv: async_channel::Receiver<Task<C>>,
 }
 
 impl<C: 'static> LoaderShared<C> {
@@ -121,10 +121,12 @@ impl<C: 'static> LoaderShared<C> {
         Asset(Arc::new(AssetShared {
             data: OnceLock::default(),
             free_send: Box::new(move |x| {
-                _ = work_send.try_send(Box::new(|ctx| {
-                    S::free(x, ctx);
-                    Box::pin(async {})
-                }));
+                _ = work_send.try_send(Task {
+                    work: Box::new(|ctx| {
+                        S::free(x, ctx);
+                        Box::pin(async {})
+                    }),
+                });
             }),
             waker: AtomicWaker::new(),
             abandoned: AtomicBool::new(false),
@@ -151,11 +153,10 @@ impl<C> Drop for LoaderShared<C> {
 }
 
 type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-type WorkMsg<C> = Box<dyn for<'a> FnOnce(&'a C) -> LoadFuture<'a> + Send + 'static>;
 
 /// A work item from [Loader::next_task]
 pub struct Task<C> {
-    work: WorkMsg<C>,
+    work: Box<dyn for<'a> FnOnce(&'a C) -> LoadFuture<'a> + Send + 'static>,
 }
 
 impl<C> Task<C> {
