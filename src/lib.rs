@@ -43,9 +43,9 @@ impl<C: Sync + 'static> Loader<C> {
             let mut asset = CancelGuard(Some(asset.clone()));
             // The channel is unbounded, so it can never become full. If the channel is closed, we
             // silently drop the task.
-            _ = self.0.work_send.try_send(Box::new(move |loader, context| {
+            _ = self.0.work_send.try_send(Box::new(move |context| {
                 Box::pin(async move {
-                    let Some(data) = source.load(&loader, context).await else {
+                    let Some(data) = source.load(context).await else {
                         return;
                     };
                     let asset = asset.0.take().unwrap();
@@ -64,16 +64,14 @@ impl<C: Sync + 'static> Loader<C> {
     /// has been called.
     pub async fn next_task(&self) -> Option<Task<C>> {
         let work = self.0.work_recv.recv().await.ok()?;
-        let loader = self.clone();
-        Some(Task { loader, work })
+        Some(Task { work })
     }
 
     /// Like [next_task](Self::next_task), except returning `None` immediately if no tasks are
     /// currently queued
     pub fn try_next_task(&self) -> Option<Task<C>> {
         let work = self.0.work_recv.try_recv().ok()?;
-        let loader = self.clone();
-        Some(Task { loader, work })
+        Some(Task { work })
     }
 
     /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
@@ -123,7 +121,7 @@ impl<C: 'static> LoaderShared<C> {
         Asset(Arc::new(AssetShared {
             data: OnceLock::default(),
             free_send: Box::new(move |x| {
-                _ = work_send.try_send(Box::new(|_, ctx| {
+                _ = work_send.try_send(Box::new(|ctx| {
                     S::free(x, ctx);
                     Box::pin(async {})
                 }));
@@ -153,11 +151,10 @@ impl<C> Drop for LoaderShared<C> {
 }
 
 type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-type WorkMsg<C> = Box<dyn for<'a> FnOnce(&'a Loader<C>, &'a C) -> LoadFuture<'a> + Send + 'static>;
+type WorkMsg<C> = Box<dyn for<'a> FnOnce(&'a C) -> LoadFuture<'a> + Send + 'static>;
 
 /// A work item from [Loader::next_task]
 pub struct Task<C> {
-    loader: Loader<C>,
     work: WorkMsg<C>,
 }
 
@@ -167,7 +164,7 @@ impl<C> Task<C> {
     /// This future is cancel-safe if and only if every [Source::load] future used with the
     /// associated [Loader] is cancel-safe.
     pub async fn run(self, context: &C) {
-        (self.work)(&self.loader, context).await;
+        (self.work)(context).await;
     }
 }
 
@@ -182,7 +179,7 @@ impl<C> Task<C> {
 /// struct Sprite(PathBuf);
 /// impl<C: Sync> Source<C> for Sprite {
 ///     type Output = Image;
-///     async fn load<'a>(self, _: &'a Loader<C>, _: &'a C) -> Option<Image> {
+///     async fn load<'a>(self, _: &'a C) -> Option<Image> {
 ///         let data = fs::read(&self.0).ok()?;
 ///         Some(decode_png(data)?)
 ///     }
@@ -200,11 +197,7 @@ pub trait Source<C>: Send + 'static {
     /// - Decode or transform data for more efficient access
     /// - Procedurally generate data
     /// - Upload data to a GPU
-    fn load<'a>(
-        self,
-        loader: &'a Loader<C>,
-        context: &'a C,
-    ) -> impl Future<Output = Option<Self::Output>> + Send + 'a;
+    fn load<'a>(self, context: &'a C) -> impl Future<Output = Option<Self::Output>> + Send + 'a;
 
     /// Dispose of the output after all [Asset] references have been dropped
     ///
@@ -295,7 +288,7 @@ mod tests {
     impl<C: Sync> Source<C> for Trivial {
         type Output = ();
 
-        async fn load<'a>(self, _: &'a Loader<C>, _: &'a C) -> Option<()> {
+        async fn load<'a>(self, _: &'a C) -> Option<()> {
             Some(())
         }
     }
@@ -305,7 +298,7 @@ mod tests {
     impl<C: Sync> Source<C> for Failed {
         type Output = ();
 
-        async fn load<'a>(self, _: &'a Loader<C>, _: &'a C) -> Option<()> {
+        async fn load<'a>(self, _: &'a C) -> Option<()> {
             None
         }
     }
