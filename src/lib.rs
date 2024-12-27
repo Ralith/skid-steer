@@ -105,7 +105,7 @@ impl<T: 'static> Drop for CancelGuard<T> {
         let Some(asset) = self.0.take() else {
             return;
         };
-        asset.0.abandoned.store(true, Ordering::Relaxed);
+        asset.0.dangling.store(true, Ordering::Relaxed);
         asset.0.waker.wake();
     }
 }
@@ -129,7 +129,7 @@ impl<C: 'static> LoaderShared<C> {
                 });
             }),
             waker: AtomicWaker::new(),
-            abandoned: AtomicBool::new(false),
+            dangling: AtomicBool::new(false),
         }))
     }
 }
@@ -239,7 +239,7 @@ impl<T: 'static + Send + Sync> Asset<T> {
     /// dropped before the [Source::load] operation ran.
     #[inline]
     pub fn is_abandoned(&self) -> bool {
-        self.0.abandoned.load(Ordering::Relaxed)
+        self.0.dangling.load(Ordering::Relaxed)
     }
 }
 
@@ -276,7 +276,7 @@ struct AssetShared<T: 'static> {
     data: OnceLock<T>,
     free_send: Box<dyn FnOnce(T) + Send + Sync>,
     waker: AtomicWaker,
-    abandoned: AtomicBool,
+    dangling: AtomicBool,
 }
 
 #[cfg(test)]
