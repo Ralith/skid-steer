@@ -1,11 +1,12 @@
 use std::{
-    fmt, future,
-    future::Future,
+    any::Any,
+    fmt,
+    future::{self, Future},
     mem,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
     },
     task::Poll,
 };
@@ -98,6 +99,21 @@ impl<C> Default for Loader<C> {
     }
 }
 
+trait LoaderHandle<T>: Send + Sync {
+    fn free(&self, x: T, f: fn(T, &dyn Any));
+}
+
+impl<T: Send + 'static, C: 'static> LoaderHandle<T> for LoaderShared<C> {
+    fn free(&self, x: T, f: fn(T, &dyn Any)) {
+        _ = self.work_send.try_send(Task {
+            work: Box::new(move |ctx| {
+                f(x, ctx);
+                Box::pin(async {})
+            }),
+        });
+    }
+}
+
 struct CancelGuard<T: 'static>(Option<Asset<T>>);
 
 impl<T: 'static> Drop for CancelGuard<T> {
@@ -116,18 +132,12 @@ struct LoaderShared<C> {
 }
 
 impl<C: 'static> LoaderShared<C> {
-    fn create_asset<S: Source<C>>(&self) -> Asset<S::Output> {
-        let work_send = self.work_send.clone();
+    fn create_asset<S: Source<C>>(self: &Arc<Self>) -> Asset<S::Output> {
+        let loader = Arc::downgrade(self);
         Asset(Arc::new(AssetShared {
             data: OnceLock::default(),
-            free_send: Box::new(move |x| {
-                _ = work_send.try_send(Task {
-                    work: Box::new(|ctx| {
-                        S::free(x, ctx);
-                        Box::pin(async {})
-                    }),
-                });
-            }),
+            loader,
+            free_fn: |x, ctx| S::free(x, ctx.downcast_ref().unwrap()),
             waker: AtomicWaker::new(),
             dangling: AtomicBool::new(false),
         }))
@@ -257,7 +267,8 @@ impl<T: 'static> Clone for Asset<T> {
 
 struct AssetShared<T: 'static> {
     data: OnceLock<T>,
-    free_send: Box<dyn FnOnce(T) + Send + Sync>,
+    loader: Weak<dyn LoaderHandle<T>>,
+    free_fn: fn(T, &dyn Any),
     waker: AtomicWaker,
     dangling: AtomicBool,
 }
@@ -269,8 +280,9 @@ impl<T: 'static> Drop for AssetShared<T> {
             // This asset was never loaded
             return;
         };
-        let send = mem::replace(&mut self.free_send, Box::new(|_| {}));
-        send(data);
+        if let Some(loader) = self.loader.upgrade() {
+            loader.free(data, self.free_fn);
+        }
     }
 }
 
