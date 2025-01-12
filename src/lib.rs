@@ -255,28 +255,23 @@ impl<T: 'static> Clone for Asset<T> {
     }
 }
 
-impl<T: 'static> Drop for Asset<T> {
-    fn drop(&mut self) {
-        // If this is the last reference to the asset, send the underlying `Arc` back to the loader
-        // to be freed w/ the proper context.
-        let Some(shared) = Arc::get_mut(&mut self.0) else {
-            // This isn't the last reference
-            return;
-        };
-        let Some(data) = mem::take(&mut shared.data).into_inner() else {
-            // This asset was never loaded
-            return;
-        };
-        let send = mem::replace(&mut shared.free_send, Box::new(|_| {}));
-        send(data);
-    }
-}
-
 struct AssetShared<T: 'static> {
     data: OnceLock<T>,
     free_send: Box<dyn FnOnce(T) + Send + Sync>,
     waker: AtomicWaker,
     dangling: AtomicBool,
+}
+
+impl<T: 'static> Drop for AssetShared<T> {
+    fn drop(&mut self) {
+        // Send the underlying `T` back to the loader to be freed w/ the proper context.
+        let Some(data) = mem::take(&mut self.data).into_inner() else {
+            // This asset was never loaded
+            return;
+        };
+        let send = mem::replace(&mut self.free_send, Box::new(|_| {}));
+        send(data);
+    }
 }
 
 #[cfg(test)]
