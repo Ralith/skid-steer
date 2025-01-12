@@ -15,18 +15,17 @@ use atomic_waker::AtomicWaker;
 
 /// Dispatches work to asynchronously populate [Asset] handles with data
 ///
-/// A [Loader] constructs handles that refer to data while it's [load](Self::load) in the
+/// A [Loader] constructs handles that refer to data while it's [load](Self::load)ed in the
 /// background. For any work to happen, [next_task] must be polled regularly on a clone of the
 /// [Loader], and the [Task]s it yields must be [ran](Task::run). For best performance, call
 /// [next_task] in a loop, spawning off the [Task]s into a multithreaded executor without waiting
 /// for their completion.
 ///
-/// While a [Source] is [load](Source::load)ing, it may access the [Loader] and a user-controlled
-/// context. The context is also available when an asset is [free](Source::free)d. This enables
-/// advanced use cases like:
+/// While a [Source] is [load](Source::load)ing, a user-controlled context. The context is also
+/// available when an asset is [free](Source::free)d. This enables advanced use cases like:
 ///
 /// - Reading assets directly into GPU memory
-/// - Loading other assets
+/// - Loading dependency assets
 /// - Caching intermediate results
 ///
 /// [next_task]: Self::next_task
