@@ -1,17 +1,16 @@
 use std::{
     any::Any,
     fmt,
-    future::{self, Future},
+    future::Future,
     mem,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, OnceLock, Weak,
     },
-    task::Poll,
 };
 
-use atomic_waker::AtomicWaker;
+use tokio::sync::{futures::Notified, Notify};
 
 /// Dispatches work to asynchronously populate [Asset] handles with data
 ///
@@ -52,7 +51,7 @@ impl<C: Sync + 'static> Loader<C> {
                         let asset = asset.0.take().unwrap();
                         // Guaranteed to succeed because there are no other callers of `set`
                         asset.0.data.set(data).unwrap_or_else(|_| unreachable!());
-                        asset.0.waker.wake();
+                        asset.0.ready.notify_waiters();
                     })
                 }),
             });
@@ -121,7 +120,7 @@ impl<T: 'static> Drop for CancelGuard<T> {
             return;
         };
         asset.0.dangling.store(true, Ordering::Relaxed);
-        asset.0.waker.wake();
+        asset.0.ready.notify_waiters();
     }
 }
 
@@ -137,7 +136,7 @@ impl<C: 'static> LoaderShared<C> {
             data: OnceLock::default(),
             loader,
             free_fn: |x, ctx| S::free(x, ctx.downcast_ref().unwrap()),
-            waker: AtomicWaker::new(),
+            ready: Notify::new(),
             dangling: AtomicBool::new(false),
         }))
     }
@@ -231,15 +230,20 @@ impl<T: 'static + Send + Sync> Asset<T> {
         if let Some(x) = self.0.data.get() {
             return Some(x);
         }
-        future::poll_fn(|cx| {
-            self.0.waker.register(cx.waker());
-            match self.0.data.get() {
-                Some(x) => return Poll::Ready(Some(x)),
-                None if self.is_abandoned() => return Poll::Ready(None),
-                None => return Poll::Pending,
+        loop {
+            let mut ready = pin!(self.0.ready.notified());
+            // If we become ready after polling our state but before calling
+            // `ready.await`, ensure that `ready.await` will succeed
+            // immediately.
+            Notified::enable(ready.as_mut());
+            if let Some(x) = self.0.data.get() {
+                return Some(x);
             }
-        })
-        .await
+            if self.is_abandoned() {
+                return None;
+            }
+            ready.await;
+        }
     }
 
     /// Whether `try_get` is guaranteed to return `None` forever
@@ -268,7 +272,7 @@ struct AssetShared<T: 'static> {
     data: OnceLock<T>,
     loader: Weak<dyn LoaderHandle<T>>,
     free_fn: fn(T, &dyn Any),
-    waker: AtomicWaker,
+    ready: Notify,
     dangling: AtomicBool,
 }
 

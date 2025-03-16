@@ -11,7 +11,7 @@ readme = "README.md"
 
 [dependencies]
 async-channel = "2.3.1"
-atomic-waker = "1.1.2"
+tokio = { version = "1.44.1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 pollster = "0.4.0"
