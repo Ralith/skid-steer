@@ -1,12 +1,14 @@
 use std::{
-    any::Any,
+    any::{Any, TypeId},
+    collections::hash_map,
     fmt,
     future::Future,
+    hash::Hash,
     mem,
     pin::{pin, Pin},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock, Weak,
+        Arc, OnceLock, RwLock, Weak,
     },
 };
 
@@ -57,6 +59,33 @@ impl<C: Sync + 'static> Loader<C> {
             });
         }
         asset
+    }
+
+    pub fn load_cached<T: Source<C> + Hash + Clone + Sync + Eq>(&self, key: T) -> Asset<T::Output> {
+        if let Some(x) = self.0.cache.read().unwrap().get(&TypeId::of::<T>()) {
+            return self.load_cached_inner(key, &**x);
+        }
+        match self.0.cache.write().unwrap().entry(TypeId::of::<T>()) {
+            hash_map::Entry::Occupied(e) => self.load_cached_inner(key, &**e.get()),
+            hash_map::Entry::Vacant(e) => {
+                self.load_cached_inner(key, &**e.insert(Box::new(Cache::<T, C>::default())))
+            }
+        }
+    }
+
+    fn load_cached_inner<T: Source<C> + Hash + Clone + Sync + Eq>(
+        &self,
+        key: T,
+        table: &(dyn Any + Send + Sync),
+    ) -> Asset<T::Output> {
+        let inner = table.downcast_ref::<Cache<T, C>>().unwrap();
+        if let Some(asset) = inner.read().unwrap().get(&key) {
+            return asset.clone();
+        }
+        match inner.write().unwrap().entry(key.clone()) {
+            hash_map::Entry::Occupied(e) => e.get().clone(),
+            hash_map::Entry::Vacant(e) => e.insert(self.load(key)).clone(),
+        }
     }
 
     /// Yields a work item that should be ran on a background thread pool to make progress
@@ -127,6 +156,7 @@ impl<T: 'static> Drop for CancelGuard<T> {
 struct LoaderShared<C> {
     work_send: async_channel::Sender<Task<C>>,
     work_recv: async_channel::Receiver<Task<C>>,
+    cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
 }
 
 impl<C: 'static> LoaderShared<C> {
@@ -148,6 +178,7 @@ impl<C> Default for LoaderShared<C> {
         Self {
             work_send,
             work_recv,
+            cache: RwLock::default(),
         }
     }
 }
@@ -157,6 +188,39 @@ impl<C> Drop for LoaderShared<C> {
         // Drain the channel so any in-flight Assets get gracefully abandoned
         self.work_recv.close();
         while let Ok(_) = self.work_recv.try_recv() {}
+    }
+}
+
+type Cache<T, C> = RwLock<foldhash::HashMap<T, Asset<<T as Source<C>>::Output>>>;
+
+pub type TypeIdMap<V> =
+    std::collections::HashMap<TypeId, V, std::hash::BuildHasherDefault<TypeIdHasher>>;
+
+/// A hasher optimized for hashing a single TypeId.
+///
+/// TypeId is already thoroughly hashed, so there's no reason to hash it again.
+/// Just leave the bits unchanged.
+#[derive(Default)]
+pub struct TypeIdHasher {
+    hash: u64,
+}
+
+impl std::hash::Hasher for TypeIdHasher {
+    fn write_u64(&mut self, n: u64) {
+        self.hash = n;
+    }
+
+    // Tolerate TypeId being either u64 or u128.
+    fn write_u128(&mut self, n: u128) {
+        self.hash = n as u64;
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!()
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
     }
 }
 
@@ -294,6 +358,7 @@ mod tests {
     use super::*;
     use pollster::block_on;
 
+    #[derive(Hash, Eq, PartialEq, Copy, Clone)]
     struct Trivial;
 
     impl<C: Sync> Source<C> for Trivial {
@@ -353,5 +418,13 @@ mod tests {
         let load_task = loader.try_next_task().unwrap();
         block_on(load_task.run(&()));
         assert!(asset.is_abandoned());
+    }
+
+    #[test]
+    fn cache() {
+        let loader = Loader::<()>::new();
+        let asset = loader.load_cached(Trivial);
+        let asset2 = loader.load_cached(Trivial);
+        assert!(Arc::ptr_eq(&asset.0, &asset2.0))
     }
 }
