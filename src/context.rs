@@ -24,7 +24,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    pub fn with_capacity(&mut self, capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             map: TypeIdMap::with_capacity_and_hasher(
                 capacity,
