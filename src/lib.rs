@@ -1,4 +1,7 @@
+mod context;
 mod type_id_map;
+
+pub use context::Context;
 
 use std::{
     any::{Any, TypeId},
@@ -26,23 +29,25 @@ use type_id_map::TypeIdMap;
 /// [next_task] in a loop, spawning off the [Task]s into a multithreaded executor without waiting
 /// for their completion.
 ///
-/// While a [Source] is [load](Source::load)ing, a user-controlled context. The context is also
-/// available when an asset is [free](Source::free)d. This enables advanced use cases like:
+/// Arbitrary references can be passed to [`Source::load`] through a [`Context`]. The context is
+/// also available when an asset is [`free`](Source::free)d. This enables advanced use cases like:
 ///
 /// - Reading assets directly into GPU memory
-/// - Loading dependency assets
+/// - Loading dependency assets, by passing in a reflexive `&Loader`
 /// - Caching intermediate results
+/// - Sharing resources between [`Source::load`] implementations without contention or globals
 ///
 /// [next_task]: Self::next_task
-pub struct Loader<C = ()>(Arc<LoaderShared<C>>);
+#[derive(Clone, Default)]
+pub struct Loader(Arc<LoaderShared>);
 
-impl<C: Sync + 'static> Loader<C> {
+impl Loader {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Begin loading `source`, immediately returning the [Asset] that will contain it
-    pub fn load<S: Source<C>>(&self, source: S) -> Asset<S::Output> {
+    pub fn load<S: Source>(&self, source: S) -> Asset<S::Output> {
         let asset = self.0.create_asset::<S>();
         {
             let mut asset = CancelGuard(Some(asset.clone()));
@@ -65,24 +70,24 @@ impl<C: Sync + 'static> Loader<C> {
         asset
     }
 
-    pub fn load_cached<T: Source<C> + Hash + Clone + Sync + Eq>(&self, key: T) -> Asset<T::Output> {
+    pub fn load_cached<T: Source + Hash + Clone + Sync + Eq>(&self, key: T) -> Asset<T::Output> {
         if let Some(x) = self.0.cache.read().unwrap().get(&TypeId::of::<T>()) {
             return self.load_cached_inner(key, &**x);
         }
         match self.0.cache.write().unwrap().entry(TypeId::of::<T>()) {
             hash_map::Entry::Occupied(e) => self.load_cached_inner(key, &**e.get()),
             hash_map::Entry::Vacant(e) => {
-                self.load_cached_inner(key, &**e.insert(Box::new(Cache::<T, C>::default())))
+                self.load_cached_inner(key, &**e.insert(Box::new(Cache::<T>::default())))
             }
         }
     }
 
-    fn load_cached_inner<T: Source<C> + Hash + Clone + Sync + Eq>(
+    fn load_cached_inner<T: Source + Hash + Clone + Sync + Eq>(
         &self,
         key: T,
         table: &(dyn Any + Send + Sync),
     ) -> Asset<T::Output> {
-        let inner = table.downcast_ref::<Cache<T, C>>().unwrap();
+        let inner = table.downcast_ref::<Cache<T>>().unwrap();
         if let Some(asset) = inner.read().unwrap().get(&key) {
             return asset.clone();
         }
@@ -96,13 +101,13 @@ impl<C: Sync + 'static> Loader<C> {
     ///
     /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
     /// has been called.
-    pub async fn next_task(&self) -> Option<Task<C>> {
+    pub async fn next_task(&self) -> Option<Task> {
         self.0.work_recv.recv().await.ok()
     }
 
     /// Like [next_task](Self::next_task), except returning `None` immediately if no tasks are
     /// currently queued
-    pub fn try_next_task(&self) -> Option<Task<C>> {
+    pub fn try_next_task(&self) -> Option<Task> {
         self.0.work_recv.try_recv().ok()
     }
 
@@ -118,36 +123,9 @@ impl<C: Sync + 'static> Loader<C> {
     }
 }
 
-impl<C> Clone for Loader<C> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
+struct CancelGuard<T: Send + 'static>(Option<Asset<T>>);
 
-impl<C> Default for Loader<C> {
-    fn default() -> Self {
-        Self(Default::default())
-    }
-}
-
-trait LoaderHandle<T>: Send + Sync {
-    fn free(&self, x: T, f: fn(T, &dyn Any));
-}
-
-impl<T: Send + 'static, C: 'static> LoaderHandle<T> for LoaderShared<C> {
-    fn free(&self, x: T, f: fn(T, &dyn Any)) {
-        _ = self.work_send.try_send(Task {
-            work: Box::new(move |ctx| {
-                f(x, ctx);
-                Box::pin(async {})
-            }),
-        });
-    }
-}
-
-struct CancelGuard<T: 'static>(Option<Asset<T>>);
-
-impl<T: 'static> Drop for CancelGuard<T> {
+impl<T: Send + 'static> Drop for CancelGuard<T> {
     fn drop(&mut self) {
         let Some(asset) = self.0.take() else {
             return;
@@ -157,26 +135,35 @@ impl<T: 'static> Drop for CancelGuard<T> {
     }
 }
 
-struct LoaderShared<C> {
-    work_send: async_channel::Sender<Task<C>>,
-    work_recv: async_channel::Receiver<Task<C>>,
+struct LoaderShared {
+    work_send: async_channel::Sender<Task>,
+    work_recv: async_channel::Receiver<Task>,
     cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
 }
 
-impl<C: 'static> LoaderShared<C> {
-    fn create_asset<S: Source<C>>(self: &Arc<Self>) -> Asset<S::Output> {
+impl LoaderShared {
+    fn create_asset<S: Source>(self: &Arc<Self>) -> Asset<S::Output> {
         let loader = Arc::downgrade(self);
         Asset(Arc::new(AssetShared {
             data: OnceLock::default(),
             loader,
-            free_fn: |x, ctx| S::free(x, ctx.downcast_ref().unwrap()),
+            free_fn: S::free,
             ready: Notify::new(),
             dangling: AtomicBool::new(false),
         }))
     }
+
+    fn free<T: Send + 'static>(&self, x: T, f: fn(T, &Context)) {
+        _ = self.work_send.try_send(Task {
+            work: Box::new(move |ctx| {
+                f(x, ctx);
+                Box::pin(async {})
+            }),
+        });
+    }
 }
 
-impl<C> Default for LoaderShared<C> {
+impl Default for LoaderShared {
     fn default() -> Self {
         let (work_send, work_recv) = async_channel::unbounded();
         Self {
@@ -187,7 +174,7 @@ impl<C> Default for LoaderShared<C> {
     }
 }
 
-impl<C> Drop for LoaderShared<C> {
+impl Drop for LoaderShared {
     fn drop(&mut self) {
         // Drain the channel so any in-flight Assets get gracefully abandoned
         self.work_recv.close();
@@ -195,21 +182,21 @@ impl<C> Drop for LoaderShared<C> {
     }
 }
 
-type Cache<T, C> = RwLock<foldhash::HashMap<T, Asset<<T as Source<C>>::Output>>>;
+type Cache<T> = RwLock<foldhash::HashMap<T, Asset<<T as Source>::Output>>>;
 
 type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// A work item from [Loader::next_task]
-pub struct Task<C> {
-    work: Box<dyn for<'a> FnOnce(&'a C) -> LoadFuture<'a> + Send + 'static>,
+pub struct Task {
+    work: Box<dyn for<'a> FnOnce(&'a Context) -> LoadFuture<'a> + Send + 'static>,
 }
 
-impl<C> Task<C> {
+impl Task {
     /// Execute the work item
     ///
     /// This future is cancel-safe if and only if every [Source::load] future used with the
     /// associated [Loader] is cancel-safe.
-    pub async fn run(self, context: &C) {
+    pub async fn run(self, context: &Context<'_>) {
         (self.work)(context).await;
     }
 }
@@ -223,15 +210,15 @@ impl<C> Task<C> {
 /// # struct Image;
 /// # fn decode_png(x: Vec<u8>) -> Option<Image> { None }
 /// struct Sprite(PathBuf);
-/// impl<C: Sync> Source<C> for Sprite {
+/// impl Source for Sprite {
 ///     type Output = Image;
-///     async fn load<'a>(self, _: &'a C) -> Option<Image> {
+///     async fn load(self, _: &Context<'_>) -> Option<Image> {
 ///         let data = fs::read(&self.0).ok()?;
 ///         Some(decode_png(data)?)
 ///     }
 /// }
 /// ```
-pub trait Source<C>: Send + 'static {
+pub trait Source: Send + 'static {
     /// Type of data available after the asset has been loaded
     type Output: Send + Sync + 'static;
 
@@ -243,17 +230,20 @@ pub trait Source<C>: Send + 'static {
     /// - Decode or transform data for more efficient access
     /// - Procedurally generate data
     /// - Upload data to a GPU
-    fn load<'a>(self, context: &'a C) -> impl Future<Output = Option<Self::Output>> + Send + 'a;
+    fn load<'a>(
+        self,
+        context: &'a Context<'a>,
+    ) -> impl Future<Output = Option<Self::Output>> + Send + 'a;
 
     /// Dispose of the output after all [Asset] references have been dropped
     ///
     /// Most implementations won't need to implement this. Useful if [Self::Output] refers to
     /// resources stored elsewhere without RAII, e.g. in unsafely managed GPU memory.
-    fn free(_output: Self::Output, _context: &C) {}
+    fn free(_output: Self::Output, _context: &Context) {}
 }
 
 /// Handle to data that might not be available yet
-pub struct Asset<T: 'static>(Arc<AssetShared<T>>);
+pub struct Asset<T: Send + 'static>(Arc<AssetShared<T>>);
 
 impl<T: 'static + Send + Sync> Asset<T> {
     /// Get the current value, if it's loaded
@@ -293,27 +283,27 @@ impl<T: 'static + Send + Sync> Asset<T> {
     }
 }
 
-impl<T: fmt::Debug + 'static> fmt::Debug for Asset<T> {
+impl<T: fmt::Debug + Send + 'static> fmt::Debug for Asset<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.data.fmt(f)
     }
 }
 
-impl<T: 'static> Clone for Asset<T> {
+impl<T: Send + 'static> Clone for Asset<T> {
     fn clone(&self) -> Self {
         Asset(self.0.clone())
     }
 }
 
-struct AssetShared<T: 'static> {
+struct AssetShared<T: Send + 'static> {
     data: OnceLock<T>,
-    loader: Weak<dyn LoaderHandle<T>>,
-    free_fn: fn(T, &dyn Any),
+    loader: Weak<LoaderShared>,
+    free_fn: fn(T, &Context),
     ready: Notify,
     dangling: AtomicBool,
 }
 
-impl<T: 'static> Drop for AssetShared<T> {
+impl<T: Send + 'static> Drop for AssetShared<T> {
     fn drop(&mut self) {
         // Send the underlying `T` back to the loader to be freed w/ the proper context.
         let Some(data) = mem::take(&mut self.data).into_inner() else {
@@ -334,40 +324,40 @@ mod tests {
     #[derive(Hash, Eq, PartialEq, Copy, Clone)]
     struct Trivial;
 
-    impl<C: Sync> Source<C> for Trivial {
+    impl Source for Trivial {
         type Output = ();
 
-        async fn load<'a>(self, _: &'a C) -> Option<()> {
+        async fn load<'a>(self, _: &'a Context<'_>) -> Option<()> {
             Some(())
         }
     }
 
     struct Failed;
 
-    impl<C: Sync> Source<C> for Failed {
+    impl Source for Failed {
         type Output = ();
 
-        async fn load<'a>(self, _: &'a C) -> Option<()> {
+        async fn load<'a>(self, _: &'a Context<'_>) -> Option<()> {
             None
         }
     }
 
     #[test]
     fn smoke() {
-        let loader = Loader::<()>::new();
+        let loader = Loader::new();
         let asset = loader.load(Trivial);
         assert!(asset.try_get().is_none());
 
         let load_task = loader.try_next_task().unwrap();
         assert!(loader.try_next_task().is_none());
-        block_on(load_task.run(&()));
+        block_on(load_task.run(&Context::new()));
         assert!(asset.try_get().is_some());
         block_on(asset.get());
         drop(asset);
 
         let free_task = loader.try_next_task().unwrap();
         assert!(loader.try_next_task().is_none());
-        block_on(free_task.run(&()));
+        block_on(free_task.run(&Context::new()));
 
         loader.close();
         assert!(loader.is_closed());
@@ -376,7 +366,7 @@ mod tests {
 
     #[test]
     fn abandoned_by_dropped_loader() {
-        let loader = Loader::<()>::new();
+        let loader = Loader::new();
         let asset = loader.load(Trivial);
         assert!(!asset.is_abandoned());
         drop(loader);
@@ -385,17 +375,17 @@ mod tests {
 
     #[test]
     fn abandoned_by_failed_load() {
-        let loader = Loader::<()>::new();
+        let loader = Loader::new();
         let asset = loader.load(Failed);
         assert!(!asset.is_abandoned());
         let load_task = loader.try_next_task().unwrap();
-        block_on(load_task.run(&()));
+        block_on(load_task.run(&Context::new()));
         assert!(asset.is_abandoned());
     }
 
     #[test]
     fn cache() {
-        let loader = Loader::<()>::new();
+        let loader = Loader::new();
         let asset = loader.load_cached(Trivial);
         let asset2 = loader.load_cached(Trivial);
         assert!(Arc::ptr_eq(&asset.0, &asset2.0))
