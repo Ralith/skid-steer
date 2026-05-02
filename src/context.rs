@@ -60,6 +60,15 @@ impl<'a> Extend<&'a (dyn Any + Sync)> for Context<'a> {
     }
 }
 
+impl<'a> FromIterator<&'a (dyn Any + Sync)> for Context<'a> {
+    fn from_iter<T: IntoIterator<Item = &'a (dyn Any + Sync)>>(iter: T) -> Self {
+        let i = iter.into_iter();
+        let mut c = Context::new();
+        c.extend(i);
+        c
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
