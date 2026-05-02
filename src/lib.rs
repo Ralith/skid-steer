@@ -10,14 +10,11 @@ use std::{
     future::Future,
     hash::Hash,
     mem,
-    pin::{pin, Pin},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, OnceLock, RwLock, Weak,
-    },
+    pin::Pin,
+    sync::{Arc, RwLock, Weak},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::SetOnce;
 
 use type_id_map::TypeIdMap;
 
@@ -61,8 +58,11 @@ impl Loader {
                         };
                         let asset = asset.0.take().unwrap();
                         // Guaranteed to succeed because there are no other callers of `set`
-                        asset.0.data.set(data).unwrap_or_else(|_| unreachable!());
-                        asset.0.ready.notify_waiters();
+                        asset
+                            .0
+                            .data
+                            .set(Some(data))
+                            .unwrap_or_else(|_| unreachable!());
                     })
                 }),
             });
@@ -130,8 +130,8 @@ impl<T: Send + 'static> Drop for CancelGuard<T> {
         let Some(asset) = self.0.take() else {
             return;
         };
-        asset.0.dangling.store(true, Ordering::Relaxed);
-        asset.0.ready.notify_waiters();
+        // Notify consumers that this asset will never be loaded
+        _ = asset.0.data.set(None);
     }
 }
 
@@ -145,11 +145,9 @@ impl LoaderShared {
     fn create_asset<S: Source>(self: &Arc<Self>) -> Asset<S::Output> {
         let loader = Arc::downgrade(self);
         Asset(Arc::new(AssetShared {
-            data: OnceLock::default(),
+            data: SetOnce::default(),
             loader,
             free_fn: S::free,
-            ready: Notify::new(),
-            dangling: AtomicBool::new(false),
         }))
     }
 
@@ -248,25 +246,12 @@ pub struct Asset<T: Send + 'static>(Arc<AssetShared<T>>);
 impl<T: 'static + Send + Sync> Asset<T> {
     /// Get the current value, if it's loaded
     pub fn try_get(&self) -> Option<&T> {
-        self.0.data.get()
+        self.0.data.get().and_then(|x| x.as_ref())
     }
 
     /// Get the current value once it's loaded, or `None` if it's [abandoned](Self::is_abandoned)
     pub async fn get(&self) -> Option<&T> {
-        // Fast path
-        if let Some(x) = self.0.data.get() {
-            return Some(x);
-        }
-        loop {
-            let ready = pin!(self.0.ready.notified());
-            if let Some(x) = self.0.data.get() {
-                return Some(x);
-            }
-            if self.is_abandoned() {
-                return None;
-            }
-            ready.await;
-        }
+        self.0.data.wait().await.as_ref()
     }
 
     /// Whether `try_get` is guaranteed to return `None` forever
@@ -275,7 +260,7 @@ impl<T: 'static + Send + Sync> Asset<T> {
     /// dropped before the [Source::load] operation ran.
     #[inline]
     pub fn is_abandoned(&self) -> bool {
-        self.0.dangling.load(Ordering::Relaxed)
+        self.0.data.get().is_some_and(Option::is_none)
     }
 }
 
@@ -292,17 +277,15 @@ impl<T: Send + 'static> Clone for Asset<T> {
 }
 
 struct AssetShared<T: Send + 'static> {
-    data: OnceLock<T>,
+    data: SetOnce<Option<T>>,
     loader: Weak<LoaderShared>,
     free_fn: fn(T, &Context),
-    ready: Notify,
-    dangling: AtomicBool,
 }
 
 impl<T: Send + 'static> Drop for AssetShared<T> {
     fn drop(&mut self) {
         // Send the underlying `T` back to the loader to be freed w/ the proper context.
-        let Some(data) = mem::take(&mut self.data).into_inner() else {
+        let Some(Some(data)) = mem::take(&mut self.data).into_inner() else {
             // This asset was never loaded
             return;
         };
