@@ -17,7 +17,7 @@ use std::{
     },
 };
 
-use tokio::sync::{futures::Notified, Notify};
+use tokio::sync::Notify;
 
 use type_id_map::TypeIdMap;
 
@@ -258,11 +258,7 @@ impl<T: 'static + Send + Sync> Asset<T> {
             return Some(x);
         }
         loop {
-            let mut ready = pin!(self.0.ready.notified());
-            // If we become ready after polling our state but before calling
-            // `ready.await`, ensure that `ready.await` will succeed
-            // immediately.
-            Notified::enable(ready.as_mut());
+            let ready = pin!(self.0.ready.notified());
             if let Some(x) = self.0.data.get() {
                 return Some(x);
             }
