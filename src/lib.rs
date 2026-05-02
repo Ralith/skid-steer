@@ -1,3 +1,5 @@
+mod type_id_map;
+
 use std::{
     any::{Any, TypeId},
     collections::hash_map,
@@ -13,6 +15,8 @@ use std::{
 };
 
 use tokio::sync::{futures::Notified, Notify};
+
+use type_id_map::TypeIdMap;
 
 /// Dispatches work to asynchronously populate [Asset] handles with data
 ///
@@ -192,37 +196,6 @@ impl<C> Drop for LoaderShared<C> {
 }
 
 type Cache<T, C> = RwLock<foldhash::HashMap<T, Asset<<T as Source<C>>::Output>>>;
-
-pub type TypeIdMap<V> =
-    std::collections::HashMap<TypeId, V, std::hash::BuildHasherDefault<TypeIdHasher>>;
-
-/// A hasher optimized for hashing a single TypeId.
-///
-/// TypeId is already thoroughly hashed, so there's no reason to hash it again.
-/// Just leave the bits unchanged.
-#[derive(Default)]
-pub struct TypeIdHasher {
-    hash: u64,
-}
-
-impl std::hash::Hasher for TypeIdHasher {
-    fn write_u64(&mut self, n: u64) {
-        self.hash = n;
-    }
-
-    // Tolerate TypeId being either u64 or u128.
-    fn write_u128(&mut self, n: u128) {
-        self.hash = n as u64;
-    }
-
-    fn write(&mut self, _: &[u8]) {
-        unreachable!()
-    }
-
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
 
 type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
