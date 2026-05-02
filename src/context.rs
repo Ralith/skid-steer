@@ -24,6 +24,13 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Convenience method for `from_iter` with less ambiguous types
+    pub fn from_slice(elts: &[&'a (dyn Any + Sync)]) -> Self {
+        let mut this = Self::with_capacity(elts.len());
+        this.extend(elts.into_iter().copied());
+        this
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             map: TypeIdMap::with_capacity_and_hasher(
