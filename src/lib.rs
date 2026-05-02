@@ -243,7 +243,7 @@ pub trait Source: Send + 'static {
 /// Handle to data that might not be available yet
 pub struct Asset<T: Send + 'static>(Arc<AssetShared<T>>);
 
-impl<T: 'static + Send + Sync> Asset<T> {
+impl<T: 'static + Send> Asset<T> {
     /// Get the current value, if it's loaded
     pub fn try_get(&self) -> Option<&T> {
         self.0.data.get().and_then(|x| x.as_ref())
