@@ -7,7 +7,9 @@ use crate::type_id_map::{TypeIdHasher, TypeIdMap};
 
 /// A set of references to at most one of any `Sync + 'static` type
 ///
-/// Enables [`Source`](crate::Source) methods to temporarily borrow arbitrary resources.
+/// Enables [`Source`](crate::Source) methods to temporarily borrow arbitrary resources. Typically
+/// created immediately prior to a batch of calls to [`Task::run`](crate::Task::run), and dropped
+/// immediately after.
 ///
 /// [`Sync`] is necessary to ensure [`Task`](crate::Task)s and their futures are `Send`, making them
 /// compatible with work-stealing async runtimes.
