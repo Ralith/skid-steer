@@ -182,7 +182,7 @@ impl Drop for LoaderShared {
 
 type Cache<T> = RwLock<foldhash::HashMap<T, Asset<<T as Source>::Output>>>;
 
-type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type LoadFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
 /// A work item from [Loader::next_task]
 pub struct Task {
@@ -194,6 +194,9 @@ impl Task {
     ///
     /// This future is cancel-safe if and only if every [Source::load] future used with the
     /// associated [Loader] is cancel-safe.
+    ///
+    /// This future is `!Send`, and hence must ran on a thread-local executor such as tokio's
+    /// `LocalRuntime`.
     pub async fn run(self, context: &Context<'_>) {
         (self.work)(context).await;
     }
@@ -228,10 +231,9 @@ pub trait Source: Send + 'static {
     /// - Decode or transform data for more efficient access
     /// - Procedurally generate data
     /// - Upload data to a GPU
-    fn load<'a>(
-        self,
-        context: &'a Context<'a>,
-    ) -> impl Future<Output = Option<Self::Output>> + Send + 'a;
+    ///
+    /// To facilitate use of thread-local state, implementations may produce `!Send` futures.
+    fn load<'a>(self, context: &'a Context<'a>) -> impl Future<Output = Option<Self::Output>> + 'a;
 
     /// Dispose of the output after all [Asset] references have been dropped
     ///
