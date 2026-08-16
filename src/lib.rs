@@ -11,7 +11,10 @@ use std::{
     hash::Hash,
     mem,
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock, Weak,
+    },
 };
 
 use tokio::sync::SetOnce;
@@ -48,6 +51,8 @@ impl Loader {
         let asset = self.0.create_asset::<S>();
         {
             let mut asset = CancelGuard(Some(asset.clone()));
+            let loader_shared = Arc::downgrade(&self.0);
+            self.0.increment_active_task_count();
             // The channel is unbounded, so it can never become full. If the channel is closed, we
             // silently drop the task.
             _ = self.0.work_send.try_send(Task {
@@ -63,6 +68,25 @@ impl Loader {
                             .data
                             .set(Some(data))
                             .unwrap_or_else(|_| unreachable!());
+
+                        if let Some(loader_shared) = loader_shared.upgrade() {
+                            // Incrementing the `live_asset_count` generally does not have any special synchronization requirements.
+                            loader_shared
+                                .live_asset_count
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            // As we want to ensure that `active_task_count` never reaches 0 unless tasks are fully drained,
+                            // one situation we need to be careful about is when the user starts loading the asset but drops
+                            // all handles before the asset is fully loaded and is ready to drain the `Loader`.
+                            // In such a situation, we cannot allow `active_task_count` to reach 0 until after that asset has been
+                            // freed. To accomplish that, we `drop(asset)` before `decrement_active_task_count` so that if that
+                            // was the last asset handle, the destructor of `AssetShared` would be called, resulting in a call
+                            // to `increment_active_task_count`. This ensures that anyone observing `active_task_count` will see
+                            // it increase before it decreases again, ensuring that it never reaches 0 until after the asset has been
+                            // freed later on.
+                            drop(asset);
+                            loader_shared.decrement_active_task_count();
+                        }
                     })
                 }),
             });
@@ -97,6 +121,12 @@ impl Loader {
         }
     }
 
+    /// Removes all assets from the cache. This may create new work that needs to be run
+    /// with [Self::next_task] if it results in assets needing to be freed.
+    pub fn clear_cache(&self) {
+        self.0.cache.write().unwrap().clear();
+    }
+
     /// Yields a work item that should be ran on a background thread pool to make progress
     ///
     /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
@@ -109,6 +139,41 @@ impl Loader {
     /// currently queued
     pub fn try_next_task(&self) -> Option<Task> {
         self.0.work_recv.try_recv().ok()
+    }
+
+    /// Wait until there are currently no active tasks. Note that there may still be some assets
+    /// that need to be freed before it is safe to close the `Loader`.
+    pub async fn drain(&self) {
+        let notified = self.0.drained.notified();
+
+        // We need to use `Acquire` ordering here for consistency with `is_drained`. While calling
+        // `drained.notified()` might already meet the synchronization requirements, the code is easier
+        // to reason about if we do not rely on that.
+        if self.0.active_task_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        // Given the synchronization requirements of `drained`, we do not need to check `active_task_count`
+        // again, so a loop is not required here.
+        notified.await
+    }
+
+    /// Returns whether there are currently no active tasks running
+    pub fn is_drained(&self) -> bool {
+        // We use `Acquire` ordering here to benefit from the synchronization requirements of `active_task_count`
+        self.0.active_task_count.load(Ordering::Acquire) == 0
+    }
+
+    /// Whether all assets loaded by this Loader have been freed. Note that this method should be called after
+    /// the `Loader` is drained, as otherwise, new assets could be created that also need freeing after this method
+    /// returns `true`.
+    pub fn all_assets_freed(&self) -> bool {
+        // We use `Acquire` ordering here to benefit from the synchronization requirements of `live_asset_count`.
+        // This makes this method suitable to use with an assertion. The guarantees we get if we observe
+        // a value of 0 ensure that we can avoid undefined behavior if freeing an asset is a soundness requirement.
+        // The fact that we *will* observe a value of 0 under certain conditions ensures that the user will
+        // not get spurious assertion failures when using this method for that purpose.
+        self.0.live_asset_count.load(Ordering::Acquire) == 0
     }
 
     /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
@@ -132,6 +197,10 @@ impl<T: Send + 'static> Drop for CancelGuard<T> {
         };
         // Notify consumers that this asset will never be loaded
         _ = asset.0.data.set(None);
+        // Decrement active task count, since the asset will never be loaded
+        if let Some(loader) = asset.0.loader.upgrade() {
+            loader.decrement_active_task_count()
+        }
     }
 }
 
@@ -139,6 +208,23 @@ struct LoaderShared {
     work_send: async_channel::Sender<Task>,
     work_recv: async_channel::Receiver<Task>,
     cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
+    /// Synchronization requirements: If an `Acquire` operation sees this reach 0, and no new `load` or
+    /// asset drop is running in parallel, the user can guarantee that there are no in-progress tasks
+    /// or tasks in the queue, and all side-effects from the tasks that had been started are observable.
+    active_task_count: AtomicUsize,
+    /// A notification will only be triggered for this field if we have the same guarantees as when
+    /// `active_task_count` reaches 0.
+    drained: tokio::sync::Notify,
+    /// Synchronization requirements:
+    ///
+    /// If an `Acquire` operation sees this reach 0 while no asset loading is running in parallel
+    /// (such as after the `Loader` is drained), then we can guarantee that the thread running the
+    /// `Acquire` operation will be able to rely on the completion of all assets' [`Source::free`]
+    /// functions and observe the side effects of these operations.
+    ///
+    /// In addition, if all assets have been dropped, and there are no in-progress tasks or tasks in the
+    /// queue, then we can guarantee that loading this field will always yield a value of 0.
+    live_asset_count: AtomicUsize,
 }
 
 impl LoaderShared {
@@ -151,13 +237,40 @@ impl LoaderShared {
         }))
     }
 
-    fn free<T: Send + 'static>(&self, x: T, f: fn(T, &Context)) {
+    fn free<T: Send + 'static>(self: Arc<Self>, x: T, f: fn(T, &Context)) {
+        let loader_shared = Arc::downgrade(&self);
+        self.increment_active_task_count();
         _ = self.work_send.try_send(Task {
             work: Box::new(move |ctx| {
                 f(x, ctx);
+                if let Some(loader_shared) = loader_shared.upgrade() {
+                    // We need to use `Release` ordering here to guarantee that any other thread that observes
+                    // `live_asset_count` becoming 0 also observes any side effects of the completion of `f(x, ctx)`.
+                    loader_shared
+                        .live_asset_count
+                        .fetch_sub(1, Ordering::Release);
+                    // We make sure to decrement the `active_task_count` *after* decrementing the `live_asset_count` so that
+                    // we can guarantee that `live_asset_count` returns 0 if it is checked after `Loader::drain` is completed.
+                    loader_shared.decrement_active_task_count();
+                }
                 Box::pin(async {})
             }),
         });
+    }
+
+    fn increment_active_task_count(&self) {
+        // Incrementing the `active_task_count` generally does not have any special synchronization requirements.
+        self.active_task_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_active_task_count(&self) {
+        // We need to use `Release` ordering here to guarantee that a thread loading this value with
+        // `Acquire` can observe any side effects of all code running before this method was called, such as asset
+        // loading or freeing. Since we notify `self.drained` based on `old_count`, we need `Acquire` ordering here, too.
+        let old_count = self.active_task_count.fetch_sub(1, Ordering::AcqRel);
+        if old_count == 1 {
+            self.drained.notify_waiters();
+        }
     }
 }
 
@@ -168,6 +281,9 @@ impl Default for LoaderShared {
             work_send,
             work_recv,
             cache: RwLock::default(),
+            active_task_count: AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+            live_asset_count: AtomicUsize::new(0),
         }
     }
 }
@@ -299,6 +415,8 @@ impl<T: Send + 'static> Drop for AssetShared<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use pollster::block_on;
 
@@ -370,5 +488,57 @@ mod tests {
         let asset = loader.load_cached(Trivial);
         let asset2 = loader.load_cached(Trivial);
         assert!(Arc::ptr_eq(&asset.0, &asset2.0))
+    }
+
+    #[test]
+    fn must_free() {
+        struct MustFree;
+
+        struct NumAliveCounter(Mutex<u32>);
+
+        impl Source for MustFree {
+            type Output = ();
+
+            async fn load(self, context: &Context<'_>) -> Option<()> {
+                let num_alive = context.get::<NumAliveCounter>().unwrap();
+                *num_alive.0.lock().unwrap() += 1;
+                Some(())
+            }
+
+            fn free(_output: Self::Output, context: &Context) {
+                let num_alive = context.get::<NumAliveCounter>().unwrap();
+                *num_alive.0.lock().unwrap() -= 1;
+            }
+        }
+
+        let loader = Loader::new();
+        let mut context = Context::new();
+        let num_alive_counter = NumAliveCounter(Mutex::new(0));
+        context.insert(&num_alive_counter);
+        let asset = loader.load(MustFree);
+
+        assert!(!loader.is_drained());
+        assert!(loader.all_assets_freed());
+
+        let load_task = loader.try_next_task().unwrap();
+        assert!(loader.try_next_task().is_none());
+        block_on(load_task.run(&context));
+        assert!(asset.try_get().is_some());
+        assert_eq!(*num_alive_counter.0.lock().unwrap(), 1);
+
+        block_on(loader.drain());
+        assert!(loader.is_drained());
+        assert!(!loader.all_assets_freed());
+
+        drop(asset);
+        assert!(!loader.is_drained());
+        assert!(!loader.all_assets_freed());
+
+        let free_task = loader.try_next_task().unwrap();
+        assert!(loader.try_next_task().is_none());
+        block_on(free_task.run(&context));
+        assert!(loader.is_drained());
+        assert!(loader.all_assets_freed());
+        assert_eq!(*num_alive_counter.0.lock().unwrap(), 0);
     }
 }
